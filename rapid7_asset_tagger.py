@@ -34,9 +34,9 @@ import argparse
 import csv
 import json
 import logging
+import os
 import sys
 import urllib.parse
-from getpass import getpass
 from pathlib import Path
 
 import requests
@@ -106,6 +106,29 @@ class Rapid7Client:
     # ------------------------------------------------------------------
     def _url(self, path: str) -> str:
         return f"{self.base_url}{API_BASE}{path}"
+
+    def test_connection(self) -> bool:
+        """Verify authentication by hitting a lightweight endpoint."""
+        try:
+            resp = self.session.get(self._url("/tags"), params={"size": 1, "page": 0})
+            if resp.status_code == 401:
+                log.error(
+                    "401 Unauthorized — authentication failed.\n"
+                    "  Possible causes:\n"
+                    "  1. Session cookie has expired — log in again and copy fresh cookies.\n"
+                    "  2. Cookie string was pasted incorrectly or truncated.\n"
+                    "  3. Missing required cookie (e.g. nexposeCCSessionID).\n"
+                    "  4. Console requires a different auth method (try Basic Auth with --user).\n"
+                )
+                return False
+            if resp.status_code == 403:
+                log.error("403 Forbidden — your account lacks API permissions.")
+                return False
+            resp.raise_for_status()
+            return True
+        except requests.ConnectionError as exc:
+            log.error("Cannot connect to %s — %s", self.base_url, exc)
+            return False
 
     def _get(self, path: str, params: dict | None = None) -> dict:
         resp = self.session.get(self._url(path), params=params)
@@ -463,6 +486,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Rapid7 console URL, e.g. https://insightvm.company.com:3780",
     )
     parser.add_argument(
+        "--cookies",
+        help="Session cookies string (e.g. 'nexposeCCSessionID=abc123'). "
+             "If not provided, you'll be prompted to enter them.",
+    )
+    parser.add_argument(
+        "--user",
+        help="Username for Basic Auth (alternative to cookies). Will prompt for password.",
+    )
+    parser.add_argument(
         "--verify-ssl",
         action="store_true",
         default=False,
@@ -519,18 +551,40 @@ def main():
     parser = build_parser()
     args = parser.parse_args()
 
-    # Collect cookies securely
-    print("Enter your Rapid7 session cookies (e.g. nexposeCCSessionID=abc123; ...):")
-    cookies = getpass("Cookies: ")
-    if not cookies.strip():
-        log.error("No cookies provided. Exiting.")
-        sys.exit(1)
+    # --- Authentication ---
+    if args.user:
+        # Basic Auth mode
+        from getpass import getpass as _getpass
+        password = _getpass(f"Password for '{args.user}': ")
+        client = Rapid7Client(
+            base_url=args.url,
+            cookies="",
+            verify_ssl=args.verify_ssl,
+        )
+        client.session.auth = (args.user, password)
+    else:
+        # Cookie-based auth
+        cookies = args.cookies or os.environ.get("RAPID7_COOKIES", "")
+        if not cookies:
+            print("\nEnter your Rapid7 session cookies.")
+            print("(Paste the full cookie string from browser DevTools → Network → Cookie header)")
+            print("Example: nexposeCCSessionID=abc123; _csrf_token=xyz\n")
+            cookies = input("Cookies: ").strip()
+        if not cookies:
+            log.error("No cookies provided. Exiting.")
+            sys.exit(1)
 
-    client = Rapid7Client(
-        base_url=args.url,
-        cookies=cookies,
-        verify_ssl=args.verify_ssl,
-    )
+        client = Rapid7Client(
+            base_url=args.url,
+            cookies=cookies,
+            verify_ssl=args.verify_ssl,
+        )
+
+    # Validate connection
+    log.info("Testing connection to %s ...", args.url)
+    if not client.test_connection():
+        sys.exit(1)
+    log.info("Authentication successful.")
 
     # Resolve identifiers
     identifiers: list[str] | None = None
