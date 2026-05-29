@@ -133,13 +133,18 @@ class Rapid7Client:
     # ------------------------------------------------------------------
     # Generic helpers
     # ------------------------------------------------------------------
-    def _url(self, path: str) -> str:
+    def _api_url(self, path: str) -> str:
+        """Build URL for REST API v3 (used for READ operations)."""
         return f"{self.base_url}{API_BASE}{path}"
+
+    def _console_url(self, path: str) -> str:
+        """Build URL for console web UI endpoints (used for WRITE operations)."""
+        return f"{self.base_url}{path}"
 
     def test_connection(self) -> bool:
         """Verify authentication by hitting a lightweight endpoint."""
         try:
-            resp = self.session.get(self._url("/tags"), params={"size": 1, "page": 0})
+            resp = self.session.get(self._api_url("/tags"), params={"size": 1, "page": 0})
             if resp.status_code == 401:
                 log.error(
                     "401 Unauthorized — authentication failed.\n"
@@ -160,34 +165,38 @@ class Rapid7Client:
             return False
 
     def _get(self, path: str, params: dict | None = None) -> dict:
-        resp = self.session.get(self._url(path), params=params)
+        """GET via REST API v3."""
+        resp = self.session.get(self._api_url(path), params=params)
         resp.raise_for_status()
         return resp.json()
 
-    def _post(self, path: str, payload=None) -> requests.Response:
-        resp = self.session.post(self._url(path), json=payload)
-        if resp.status_code == 406:
-            log.error(
-                "406 Not Acceptable from %s.\n"
-                "  Response body: %s\n"
-                "  Ensure your cookie string includes 'nexposeCCSessionID=<value>'.\n"
-                "  The session ID must be present for write operations.\n"
-                "  Alternatively, use --user for Basic Auth.",
-                path,
-                resp.text[:500],
-            )
+    def _post_json(self, path: str, payload=None) -> requests.Response:
+        """POST JSON via REST API v3 (may fail with cookie auth on some consoles)."""
+        resp = self.session.post(self._api_url(path), json=payload)
         resp.raise_for_status()
         return resp
 
-    def _put(self, path: str, payload=None) -> requests.Response:
-        resp = self.session.put(self._url(path), json=payload)
-        if resp.status_code == 406:
-            log.error("406 Not Acceptable from %s. Ensure nexposeCCSessionID is in cookies. Response: %s", path, resp.text[:500])
+    def _post_form(self, path: str, data: dict = None) -> requests.Response:
+        """POST form-urlencoded to console web UI endpoint (works with cookie auth)."""
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "Accept": "*/*",
+        }
+        resp = self.session.post(self._console_url(path), data=data, headers=headers)
         resp.raise_for_status()
         return resp
 
-    def _delete(self, path: str) -> requests.Response:
-        resp = self.session.delete(self._url(path))
+    def _put_console(self, path: str, data: dict = None) -> requests.Response:
+        """PUT to console web UI endpoint (works with cookie auth)."""
+        headers = {"Accept": "*/*"}
+        resp = self.session.put(self._console_url(path), data=data, headers=headers)
+        resp.raise_for_status()
+        return resp
+
+    def _delete_console(self, path: str) -> requests.Response:
+        """DELETE to console web UI endpoint (works with cookie auth)."""
+        headers = {"Accept": "*/*"}
+        resp = self.session.delete(self._console_url(path), headers=headers)
         resp.raise_for_status()
         return resp
 
@@ -226,20 +235,54 @@ class Rapid7Client:
 
     def create_tag(self, tag_name: str, tag_type: str = "custom") -> dict:
         """
-        Create a new custom tag.
+        Create a new custom tag using the console web UI endpoint.
 
         tag_type: 'custom', 'owner', 'location', 'criticality'
         """
-        payload = {
-            "name": tag_name,
-            "type": tag_type,
+        # Map tag types to Nexpose internal type values
+        type_map = {
+            "custom": "custom",
+            "owner": "owner",
+            "location": "location",
+            "criticality": "criticality",
         }
-        resp = self._post("/tags", payload)
-        # The response Location header or body contains the new tag
-        if resp.status_code == 201:
-            tag_id = resp.json().get("id")
-            return self._get(f"/tags/{tag_id}")
-        return resp.json()
+
+        # Try REST API v3 first (works with Basic Auth)
+        payload = {"name": tag_name, "type": type_map.get(tag_type, "custom")}
+        try:
+            resp = self._post_json("/tags", payload)
+            if resp.status_code == 201:
+                tag_data = resp.json()
+                tag_id = tag_data.get("id")
+                if tag_id:
+                    return self._get(f"/tags/{tag_id}")
+                return tag_data
+            return resp.json()
+        except requests.HTTPError as e:
+            if e.response.status_code != 406:
+                raise
+            log.info("REST API v3 returned 406 for tag creation, using console endpoint...")
+
+        # Fallback: use the console's internal web UI endpoint
+        form_data = {
+            "tagName": tag_name,
+            "tagType": tag_type,
+        }
+        resp = self._post_form("/data/tag/save", data=form_data)
+        log.info("Tag creation request sent via console endpoint.")
+
+        # The console endpoint may not return JSON with the tag ID,
+        # so search for the tag we just created
+        tag = self.find_tag_by_name(tag_name)
+        if tag:
+            log.info("Tag '%s' created successfully (id=%s).", tag_name, tag["id"])
+            return tag
+
+        # If still not found, raise an error
+        raise RuntimeError(
+            f"Tag '{tag_name}' creation appeared to succeed but tag not found. "
+            f"Console response: {resp.text[:200]}"
+        )
 
     def get_or_create_tag(self, tag_name: str, tag_type: str = "custom") -> dict:
         """Find tag by name; create it if it doesn't exist."""
@@ -256,11 +299,43 @@ class Rapid7Client:
 
     def tag_asset(self, tag_id: int, asset_id: int):
         """Add a tag to a single asset."""
-        self._put(f"/tags/{tag_id}/assets/{asset_id}")
+        # Try REST API v3 first
+        try:
+            resp = self.session.put(
+                self._api_url(f"/tags/{tag_id}/assets/{asset_id}"),
+                headers={"Accept": "*/*"},
+            )
+            if resp.status_code == 406:
+                raise requests.HTTPError(response=resp)
+            resp.raise_for_status()
+            return
+        except requests.HTTPError as e:
+            if hasattr(e, 'response') and e.response is not None and e.response.status_code != 406:
+                raise
+            log.debug("REST API v3 returned 406 for tag_asset, using console endpoint...")
+
+        # Fallback: console endpoint
+        self._put_console(f"/api/3/tags/{tag_id}/assets/{asset_id}")
 
     def untag_asset(self, tag_id: int, asset_id: int):
         """Remove a tag from a single asset."""
-        self._delete(f"/tags/{tag_id}/assets/{asset_id}")
+        # Try REST API v3 first
+        try:
+            resp = self.session.delete(
+                self._api_url(f"/tags/{tag_id}/assets/{asset_id}"),
+                headers={"Accept": "*/*"},
+            )
+            if resp.status_code == 406:
+                raise requests.HTTPError(response=resp)
+            resp.raise_for_status()
+            return
+        except requests.HTTPError as e:
+            if hasattr(e, 'response') and e.response is not None and e.response.status_code != 406:
+                raise
+            log.debug("REST API v3 returned 406 for untag_asset, using console endpoint...")
+
+        # Fallback: console endpoint
+        self._delete_console(f"/api/3/tags/{tag_id}/assets/{asset_id}")
 
     # ------------------------------------------------------------------
     # Asset search
@@ -291,10 +366,18 @@ class Rapid7Client:
         results = []
         while True:
             resp = self.session.post(
-                self._url(f"/assets/search"),
+                self._api_url("/assets/search"),
                 json=payload,
                 params={"size": PAGE_SIZE, "page": page},
             )
+            if resp.status_code == 406:
+                # Retry with Accept: */* header override
+                resp = self.session.post(
+                    self._api_url("/assets/search"),
+                    json=payload,
+                    params={"size": PAGE_SIZE, "page": page},
+                    headers={"Accept": "*/*"},
+                )
             resp.raise_for_status()
             data = resp.json()
             results.extend(data.get("resources", []))
