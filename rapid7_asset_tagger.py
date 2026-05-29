@@ -87,11 +87,16 @@ class Rapid7Client:
         # Parse and set cookies
         self._set_cookies(cookies)
 
-        # Common headers
+        # Common headers — must include X-Requested-With and the session ID header
+        # Rapid7 console uses Nexposeccsessionid header as CSRF protection
         self.session.headers.update({
             "Content-Type": "application/json",
             "Accept": "application/json",
+            "X-Requested-With": "XMLHttpRequest",
         })
+
+        # Extract session ID and set it as the Nexposeccsessionid header
+        self._apply_session_id_header()
 
     def _set_cookies(self, cookie_string: str):
         """Parse a raw cookie header string and load into the session."""
@@ -100,6 +105,30 @@ class Rapid7Client:
             if "=" in pair:
                 name, value = pair.split("=", 1)
                 self.session.cookies.set(name.strip(), value.strip())
+
+    def _apply_session_id_header(self):
+        """
+        Extract the nexposeCCSessionID from cookies and set it as
+        the 'Nexposeccsessionid' request header.
+        Rapid7 requires this for ALL state-changing (POST/PUT/DELETE) requests
+        when using cookie-based auth — without it you get 406.
+        """
+        # Try common session cookie names (case-insensitive search)
+        session_id = None
+        for name in self.session.cookies.keys():
+            if name.lower() == "nexposeccsessionid":
+                session_id = self.session.cookies.get(name)
+                break
+
+        if session_id:
+            self.session.headers["Nexposeccsessionid"] = session_id
+            log.debug("Set Nexposeccsessionid header from cookie.")
+        else:
+            log.warning(
+                "Could not find 'nexposeCCSessionID' in cookies. "
+                "Write operations may fail with 406. "
+                "Make sure your cookie string includes nexposeCCSessionID=<value>."
+            )
 
     # ------------------------------------------------------------------
     # Generic helpers
@@ -137,11 +166,23 @@ class Rapid7Client:
 
     def _post(self, path: str, payload=None) -> requests.Response:
         resp = self.session.post(self._url(path), json=payload)
+        if resp.status_code == 406:
+            log.error(
+                "406 Not Acceptable from %s.\n"
+                "  Response body: %s\n"
+                "  Ensure your cookie string includes 'nexposeCCSessionID=<value>'.\n"
+                "  The session ID must be present for write operations.\n"
+                "  Alternatively, use --user for Basic Auth.",
+                path,
+                resp.text[:500],
+            )
         resp.raise_for_status()
         return resp
 
     def _put(self, path: str, payload=None) -> requests.Response:
         resp = self.session.put(self._url(path), json=payload)
+        if resp.status_code == 406:
+            log.error("406 Not Acceptable from %s. Ensure nexposeCCSessionID is in cookies. Response: %s", path, resp.text[:500])
         resp.raise_for_status()
         return resp
 
