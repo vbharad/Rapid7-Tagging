@@ -21,3 +21,31 @@ Traceback (most recent call last):
   File "C:\Users\akankanameli\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\LocalCache\local-packages\Python313\site-packages\requests\models.py", line 1167, in raise_for_status
     raise HTTPError(http_error_msg, response=self)
 requests.exceptions.HTTPError: 406 Client Error:  for url: https://rapid7.quinstreet.net/api/3/tags
+
+
+
+
+
+POST /data/tag/2/assetgroups HTTP/1.1
+Host: rapid7.quinstreet.net
+Cookie: COOKIES
+Content-Length: 69
+Sec-Ch-Ua-Platform: "Windows"
+X-Requested-With: XMLHttpRequest
+Nexposeccsessionid: sessioniD
+Sec-Ch-Ua: "Chromium";v="148", "Google Chrome";v="148", "Not/A)Brand";v="99"
+Content-Type: application/x-www-form-urlencoded; charset=UTF-8
+Sec-Ch-Ua-Mobile: ?0
+User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36
+Accept: */*
+Origin: https://rapid7.quinstreet.net
+Sec-Fetch-Site: same-origin
+Sec-Fetch-Mode: cors
+Sec-Fetch-Dest: empty
+Referer: https://rapid7.quinstreet.net/tag/detail.jsp?tagID=2
+Accept-Encoding: gzip, deflate, br
+Accept-Language: en-US,en;q=0.9
+Priority: u=1, i
+Connection: keep-alive
+
+sort=-1&dir=-1&startIndex=-1&results=-1&table-id=asset-groups&tagID=2
